@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 import joblib
 import os
 import sys
+import subprocess
 from sklearn.metrics import confusion_matrix, classification_report
 
 # Add path for config import
@@ -236,13 +237,36 @@ st.markdown("""
 # HELPER FUNCTIONS
 # ============================================================================
 
-@st.cache_resource
 def load_model():
-    """Load trained model from disk"""
+    """Load trained model from disk with deployment-friendly diagnostics."""
     try:
         model = joblib.load(settings.BEST_MODEL_PATH)
         scaler = joblib.load(settings.SCALER_PATH)
         return model, scaler
+    except ModuleNotFoundError as e:
+        missing_module = str(e)
+        if 'lightgbm' in missing_module.lower():
+            st.error(
+                "Error loading model: LightGBM is missing in deployment environment. "
+                "Add `lightgbm` to requirements.txt and redeploy."
+            )
+        else:
+            st.error(f"Error loading model dependency: {e}")
+        return None, None
+    except FileNotFoundError:
+        missing = []
+        if not os.path.exists(settings.BEST_MODEL_PATH):
+            missing.append(settings.BEST_MODEL_PATH)
+        if not os.path.exists(settings.SCALER_PATH):
+            missing.append(settings.SCALER_PATH)
+
+        if missing:
+            st.error(
+                "Model artifacts not found. Missing files:\n- " + "\n- ".join(missing)
+            )
+        else:
+            st.error("Model artifacts could not be loaded.")
+        return None, None
     except Exception as e:
         st.error(f"Error loading model: {e}")
         return None, None
@@ -664,8 +688,25 @@ def modern_prediction_page():
         st.error("⚠️ Model not loaded. Please train a model first.")
         if st.button("🚀 Train Model Now"):
             with st.spinner("Training model... This may take a few minutes"):
-                os.system("python src/model_training.py")
-            st.success("Model trained successfully! Please refresh the page.")
+                result = subprocess.run(
+                    [sys.executable, "src/model_training.py"],
+                    capture_output=True,
+                    text=True
+                )
+
+            if result.returncode == 0:
+                st.success("Model trained successfully! Retrying model load...")
+                model, scaler = load_model()
+                if model is None:
+                    st.warning("Training finished but model still could not be loaded.")
+                    st.code(result.stdout[-2000:] if result.stdout else "No stdout output.")
+                    st.code(result.stderr[-2000:] if result.stderr else "No stderr output.")
+                    return
+            else:
+                st.error("Model training failed in deployment environment.")
+                st.code(result.stdout[-2000:] if result.stdout else "No stdout output.")
+                st.code(result.stderr[-2000:] if result.stderr else "No stderr output.")
+                return
         return
     
     # Tabs for different input modes
