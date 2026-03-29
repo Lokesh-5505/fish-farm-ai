@@ -237,8 +237,48 @@ st.markdown("""
 # HELPER FUNCTIONS
 # ============================================================================
 
-def load_model():
-    """Load trained model from disk with deployment-friendly diagnostics."""
+def train_model_artifacts():
+    """Train and persist model artifacts by running project training pipeline."""
+    result = subprocess.run(
+        [sys.executable, "src/model_training.py"],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode == 0:
+        return True, result.stdout or "Model training finished successfully."
+
+    combined_logs = "\n".join(
+        part for part in [result.stdout, result.stderr] if part
+    )
+    return False, combined_logs or "Model training failed with no logs."
+
+def _try_retrain_and_reload(retrain_message):
+    """Attempt one retrain per session and reload model artifacts."""
+    retrain_key = "auto_retrain_attempted"
+    if st.session_state.get(retrain_key):
+        st.warning("Automatic retraining was already attempted in this session.")
+        return None, None
+
+    st.session_state[retrain_key] = True
+    st.info(retrain_message)
+    ok, logs = train_model_artifacts()
+    if ok:
+        st.success("Retraining completed. Reloading model artifacts...")
+        try:
+            model = joblib.load(settings.BEST_MODEL_PATH)
+            scaler = joblib.load(settings.SCALER_PATH)
+            return model, scaler
+        except Exception as reload_error:
+            st.error(f"Retrained artifacts still failed to load: {reload_error}")
+            return None, None
+
+    st.error("Automatic retraining failed.")
+    st.code(logs[-2000:])
+    return None, None
+
+def load_model(allow_retrain=False):
+    """Load trained model/scaler with optional self-healing retrain."""
     try:
         model = joblib.load(settings.BEST_MODEL_PATH)
         scaler = joblib.load(settings.SCALER_PATH)
@@ -247,11 +287,17 @@ def load_model():
         missing_module = str(e)
         if 'lightgbm' in missing_module.lower():
             st.error(
-                "Error loading model: LightGBM is missing in deployment environment. "
-                "Add `lightgbm` to requirements.txt and redeploy."
+                "Error loading model: LightGBM dependency is missing for the current "
+                "saved artifact."
             )
         else:
             st.error(f"Error loading model dependency: {e}")
+
+        if allow_retrain:
+            return _try_retrain_and_reload(
+                "Trying to retrain model artifacts with supported models..."
+            )
+
         return None, None
     except FileNotFoundError:
         missing = []
@@ -261,22 +307,41 @@ def load_model():
             missing.append(settings.SCALER_PATH)
 
         if missing:
-            st.error(
-                "Model artifacts not found. Missing files:\n- " + "\n- ".join(missing)
-            )
+            st.error("Model artifacts not found. Missing files:\n- " + "\n- ".join(missing))
         else:
             st.error("Model artifacts could not be loaded.")
+
+        if allow_retrain:
+            return _try_retrain_and_reload(
+                "Trying to generate model artifacts now..."
+            )
+
         return None, None
     except Exception as e:
         st.error(f"Error loading model: {e}")
+
+        if allow_retrain:
+            return _try_retrain_and_reload(
+                "Trying fallback retraining after model load failure..."
+            )
+
         return None, None
 
 @st.cache_data
 def load_historical_data():
     """Load historical data for analysis"""
     try:
-        return pd.read_csv(settings.RAW_DATA_FILE)
-    except:
+        data = pd.read_csv(settings.RAW_DATA_FILE)
+        required_cols = settings.INPUT_FEATURES + [settings.TARGET_FEATURE]
+        missing_cols = [col for col in required_cols if col not in data.columns]
+        if missing_cols:
+            st.warning(
+                "Historical data is missing required columns for confusion matrix: "
+                + ", ".join(missing_cols)
+            )
+            return None
+        return data
+    except Exception:
         return None
 
 def get_risk_category(probability_or_prediction):
@@ -598,7 +663,7 @@ def modern_home_page():
             st.markdown("### 📊 Best Model - Confusion Matrix")
             
             try:
-                model, scaler = load_model()
+                model, scaler = load_model(allow_retrain=True)
                 data = load_historical_data()
                 
                 if model is not None and data is not None:
@@ -682,7 +747,7 @@ def modern_prediction_page():
     </div>
     """, unsafe_allow_html=True)
     
-    model, scaler = load_model()
+    model, scaler = load_model(allow_retrain=True)
     
     if model is None:
         st.error("⚠️ Model not loaded. Please train a model first.")
@@ -696,7 +761,7 @@ def modern_prediction_page():
 
             if result.returncode == 0:
                 st.success("Model trained successfully! Retrying model load...")
-                model, scaler = load_model()
+                model, scaler = load_model(allow_retrain=True)
                 if model is None:
                     st.warning("Training finished but model still could not be loaded.")
                     st.code(result.stdout[-2000:] if result.stdout else "No stdout output.")
